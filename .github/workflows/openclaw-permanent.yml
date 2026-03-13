@@ -1,0 +1,841 @@
+name: Permanent OpenClaw Node
+
+on:
+  workflow_dispatch:              # 支持手动触发
+  repository_dispatch:            # 支持通过 API 触发
+    types: [restart-permanent-openclaw]
+
+permissions:
+  contents: write
+  actions: write  # 允许触发其他 workflow
+
+# 并发控制：新运行会取消旧运行，实现无缝切换
+concurrency:
+  group: permanent-openclaw-node
+  cancel-in-progress: true
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install OpenSSH and Node.js
+        run: |
+          set -e
+          echo ">>> Install OpenSSH, curl, openssl, python3"
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y openssh-server curl openssl python3
+          elif command -v yum >/dev/null 2>&1; then
+            sudo yum install -y openssh-server curl openssl python3
+          else
+            echo "Unsupported package manager, please install openssh-server & curl & openssl & python3 manually."
+            exit 1
+          fi
+
+          echo ">>> OpenSSH installed"
+          
+          echo ">>> Installing nvm and Node.js 22..."
+          curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+          export NVM_DIR="$HOME/.nvm"
+          [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+          nvm install 22
+          nvm alias default 22
+          echo ">>> Node.js 22 installed"
+
+          echo ">>> Installing openclaw..."
+          npm install -g openclaw@latest
+          echo ">>> openclaw installed"
+
+      - name: Configure SSH, start bore tunnels and save endpoints
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_TTL_MINUTES: "360"
+          NODE_WEB_PORTS: "6000"
+          NODE_PORT_PREFIXES: ""
+        run: |
+          set -euo pipefail
+
+          TTL_MIN=${NODE_TTL_MINUTES:-60}
+          TTL_SEC=$(( TTL_MIN * 60 ))
+          PORT_LIST_STR="${NODE_WEB_PORTS:-}"
+          PORT_PREFIXES_STR="${NODE_PORT_PREFIXES:-}"
+
+          echo ">>> TTL (minutes): $TTL_MIN"
+          echo ">>> Extra TCP ports to expose via bore: ${PORT_LIST_STR:-<none>}"
+          echo ">>> Port prefixes configuration: ${PORT_PREFIXES_STR:-<none>}"
+
+          # ===== 解析端口前缀配置 =====
+          declare -A PORT_PREFIX_MAP
+          if [ -n "$PORT_PREFIXES_STR" ]; then
+            echo ">>> Parsing port prefixes..."
+            IFS=',' read -ra PREFIX_PAIRS <<< "$PORT_PREFIXES_STR"
+            for pair in "${PREFIX_PAIRS[@]}"; do
+              if [[ "$pair" =~ ^([0-9]+):([a-zA-Z0-9-]+)$ ]]; then
+                port="${BASH_REMATCH[1]}"
+                prefix="${BASH_REMATCH[2]}"
+                PORT_PREFIX_MAP["$port"]="$prefix"
+                echo ">>> Port $port -> prefix: $prefix"
+              fi
+            done
+          fi
+
+          # ===== 创建本地 .openclaw 目录 =====
+          echo ">>> Creating local ~/.openclaw directory"
+          mkdir -p ~/.openclaw
+          echo ">>> Created ~/.openclaw directory"
+
+          # 创建或更新 reboot.txt（只在文件不存在时创建模板）
+          REBOOT_FILE="reboot.txt"
+          if [ ! -f "$REBOOT_FILE" ]; then
+            echo ">>> Creating reboot.txt template (first run or file doesn't exist)..."
+            echo "# 开机时可以在这里添加自定义启动命令" > "$REBOOT_FILE"
+            echo "# 例如：启动 OpenClaw 服务器" >> "$REBOOT_FILE"
+            echo "" >> "$REBOOT_FILE"
+            echo "# 注意：OpenClaw 和数据目录位于 runner 用户下" >> "$REBOOT_FILE"
+            echo "# - OpenClaw 安装位置：/home/runner/.nvm/versions/node/v22.*/bin/openclaw" >> "$REBOOT_FILE"
+            echo "# - 数据目录：/home/runner/.openclaw" >> "$REBOOT_FILE"
+            echo "# - SSH 登录后切换到 runner 用户：su - runner" >> "$REBOOT_FILE"
+            echo "" >> "$REBOOT_FILE"
+            echo "# OpenClaw 使用说明：" >> "$REBOOT_FILE"
+            echo "# 1. 如果已有配置（从备份恢复），直接启动：" >> "$REBOOT_FILE"
+            echo "#    su - runner -c 'openclaw'" >> "$REBOOT_FILE"
+            echo "# 2. 如果是首次使用，需要先配置：" >> "$REBOOT_FILE"
+            echo "#    su - runner -c 'openclaw onboard'" >> "$REBOOT_FILE"
+            echo "# 3. 安装为守护进程（开机自动启动）：" >> "$REBOOT_FILE"
+            echo "#    su - runner -c 'openclaw onboard --install-daemon'" >> "$REBOOT_FILE"
+            echo "" >> "$REBOOT_FILE"
+            echo "# 自动启动示例（取消注释以使用）：" >> "$REBOOT_FILE"
+            echo "# su - runner -c 'cd ~/.openclaw && openclaw' &" >> "$REBOOT_FILE"
+            echo "" >> "$REBOOT_FILE"
+            echo ">>> reboot.txt template created"
+          else
+            echo ">>> reboot.txt already exists, keeping existing content"
+          fi
+          
+          # 创建或更新 shut.txt（只在文件不存在时创建模板）
+          SHUTDOWN_FILE="shut.txt"
+          if [ ! -f "$SHUTDOWN_FILE" ]; then
+            echo ">>> Creating shut.txt template (first run or file doesn't exist)..."
+            echo "# 关机前可以在这里添加自定义关机命令" > "$SHUTDOWN_FILE"
+            echo "# 例如：清理临时文件、保存配置等" >> "$SHUTDOWN_FILE"
+            echo "" >> "$SHUTDOWN_FILE"
+            echo ">>> shut.txt template created"
+          else
+            echo ">>> shut.txt already exists, keeping existing content"
+          fi
+
+          # 自动下载并恢复最新备份（如果backup.txt存在）
+          if [ -f "backup.txt" ] && [ -s "backup.txt" ]; then
+            echo ">>> Found backup.txt, downloading latest backup..."
+            
+            # 获取最后一行备份信息
+            LAST_LINE=$(tail -n 1 "backup.txt")
+            LAST_FILENAME=$(echo "$LAST_LINE" | awk '{print $1}')
+            
+            # 检查是否是分片备份（文件名包含.part数字.tar.gz）
+            if [[ "$LAST_FILENAME" =~ \.part[0-9]+\.tar\.gz$ ]]; then
+              # 这是分片备份，提取基础文件名和时间戳
+              BASE_NAME=$(echo "$LAST_FILENAME" | sed 's/\.part[0-9]*\.tar\.gz$//')
+              echo ">>> Found split backup: $BASE_NAME"
+              
+              # 从backup.txt中找到所有相同基础名的分片
+              # 在临时目录操作，避免权限问题
+              cd /tmp
+              DOWNLOAD_SUCCESS=true
+              
+              # 创建临时文件存储分片信息
+              TEMP_PARTS="/tmp/backup_parts.txt"
+              > "$TEMP_PARTS"
+              
+              # 倒序读取backup.txt，找到所有相同基础名的分片
+              tac "$GITHUB_WORKSPACE/backup.txt" | while read -r line; do
+                if [ -z "$line" ] || [[ "$line" =~ ^# ]]; then
+                  continue
+                fi
+                
+                FILENAME=$(echo "$line" | awk '{print $1}')
+                FILE_URL=$(echo "$line" | awk '{print $2}')
+                
+                # 检查是否属于同一个备份的分片
+                if [[ "$FILENAME" =~ ^${BASE_NAME}\.part[0-9]+\.tar\.gz$ ]]; then
+                  echo "$FILENAME $FILE_URL" >> "$TEMP_PARTS"
+                else
+                  # 遇到不同备份的文件，停止
+                  break
+                fi
+              done
+              
+              # 读取分片信息并下载
+              PART_COUNT=0
+              if [ -s "$TEMP_PARTS" ]; then
+                while read -r FILENAME FILE_URL; do
+                  PART_NUM=$(echo "$FILENAME" | grep -o 'part[0-9]*' | sed 's/part//')
+                  echo ">>> Downloading part $PART_NUM: $FILENAME from $FILE_URL"
+                  
+                  # 下载为原始文件名（bashupload.app 下载的是 .bin 但内容是 .tar.gz）
+                  if curl -L -o "$FILENAME" "$FILE_URL"; then
+                    echo ">>> Part $PART_NUM downloaded successfully"
+                    PART_COUNT=$((PART_COUNT + 1))
+                  else
+                    echo "!!! Failed to download part $PART_NUM"
+                    DOWNLOAD_SUCCESS=false
+                    break
+                  fi
+                done < "$TEMP_PARTS"
+              fi
+              
+              rm -f "$TEMP_PARTS"
+              
+              if [ "$DOWNLOAD_SUCCESS" = true ] && [ "$PART_COUNT" -gt 0 ]; then
+                echo ">>> All $PART_COUNT parts downloaded, reassembling..."
+                BACKUP_FILE="${BASE_NAME}.tar.gz"
+                
+                # 重新组装文件（按part1, part2, part3...顺序）
+                > "$BACKUP_FILE"  # 创建空文件
+                for i in $(seq 1 "$PART_COUNT"); do
+                  PART_FILE="${BASE_NAME}.part${i}.tar.gz"
+                  if [ -f "$PART_FILE" ]; then
+                    cat "$PART_FILE" >> "$BACKUP_FILE"
+                    rm -f "$PART_FILE"
+                  else
+                    echo "!!! Part file $PART_FILE not found"
+                    DOWNLOAD_SUCCESS=false
+                    break
+                  fi
+                done
+                
+                if [ "$DOWNLOAD_SUCCESS" = true ]; then
+                  # 解压备份文件到 ~/.openclaw
+                  if tar -xzf "$BACKUP_FILE" -C ~/.openclaw; then
+                    echo ">>> Split backup restored successfully to ~/.openclaw"
+                  else
+                    echo "!!! Failed to extract reassembled backup file"
+                  fi
+                  
+                  rm -f "$BACKUP_FILE"
+                else
+                  echo "!!! Failed to reassemble split backup"
+                fi
+              else
+                echo "!!! Failed to download all parts of split backup"
+              fi
+              
+              # 切换回仓库目录
+              cd "$GITHUB_WORKSPACE"
+              
+            else
+              # 这是单文件备份
+              BACKUP_FILENAME=$(echo "$LAST_LINE" | awk '{print $1}')
+              BACKUP_URL=$(echo "$LAST_LINE" | awk '{print $2}')
+              
+              if [ -n "$BACKUP_URL" ] && [ -n "$BACKUP_FILENAME" ]; then
+                echo ">>> Downloading single backup: $BACKUP_FILENAME from $BACKUP_URL"
+                # 在临时目录下载，避免权限问题
+                cd /tmp
+                
+                # 下载备份文件（bashupload.app 的链接已经是 .bin 结尾，但内容是 tar.gz）
+                if curl -L -o "$BACKUP_FILENAME" "$BACKUP_URL"; then
+                  # 检查下载的文件大小
+                  DOWNLOADED_SIZE=$(stat -c%s "$BACKUP_FILENAME" 2>/dev/null || echo "0")
+                  echo ">>> Downloaded file size: $DOWNLOADED_SIZE bytes"
+                  
+                  if [ "$DOWNLOADED_SIZE" -lt 100 ]; then
+                    echo "!!! Downloaded file is too small ($DOWNLOADED_SIZE bytes), likely an error or expired link"
+                    echo "!!! File content:"
+                    cat "$BACKUP_FILENAME"
+                    echo ""
+                    echo "!!! Skipping restore, backup URL may have expired"
+                  else
+                    echo ">>> Download successful, extracting to ~/.openclaw..."
+                    
+                    # bashupload.app 的文件虽然是 .bin 链接，但内容是 tar.gz
+                    # tar 会自动识别 gzip 格式
+                    if tar -xzf "$BACKUP_FILENAME" -C ~/.openclaw; then
+                      echo ">>> Backup restored successfully to ~/.openclaw"
+                    else
+                      echo "!!! Failed to extract backup file"
+                      echo "!!! The backup file may be corrupted or the format is incorrect"
+                    fi
+                  fi
+                  
+                  # 清理下载的备份文件
+                  rm -f "$BACKUP_FILENAME"
+                else
+                  echo "!!! Failed to download backup from $BACKUP_URL"
+                fi
+              else
+                echo "!!! Invalid backup entry format in backup.txt"
+              fi
+              
+              # 切换回仓库目录
+              cd "$GITHUB_WORKSPACE"
+            fi
+          else
+            echo ">>> No backup.txt found or file is empty, skipping backup restore (first run?)"
+          fi
+
+          # 自动启动 OpenClaw（如果配置文件存在）
+          echo ">>> Checking for OpenClaw configuration..."
+          if [ -d ~/.openclaw ] && [ "$(ls -A ~/.openclaw 2>/dev/null)" ]; then
+            echo ">>> OpenClaw data directory exists, attempting to start OpenClaw..."
+            # 在后台启动 OpenClaw
+            nohup bash -c 'export NVM_DIR="$HOME/.nvm"; [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"; cd ~/.openclaw && openclaw' > ~/.openclaw/openclaw.log 2>&1 &
+            OPENCLAW_PID=$!
+            echo ">>> OpenClaw started in background with PID $OPENCLAW_PID"
+            echo ">>> OpenClaw logs: ~/.openclaw/openclaw.log"
+          else
+            echo ">>> OpenClaw data directory is empty or doesn't exist, skipping auto-start"
+            echo ">>> To configure OpenClaw, SSH in and run: su - runner -c 'openclaw onboard'"
+          fi
+
+          # 执行重启命令文件（如果存在）
+          REBOOT_FILE="reboot.txt"
+          
+          if [ -f "$REBOOT_FILE" ]; then
+            echo ">>> Found $REBOOT_FILE, executing commands..."
+            echo ">>> Working directory: /root"
+            
+            # 使用 sudo 切换到 /root 目录执行命令
+            sudo bash -c "cd /root && while IFS= read -r cmd || [ -n \"\$cmd\" ]; do
+              # 跳过空行和注释行
+              if [ -z \"\$cmd\" ] || [[ \"\$cmd\" =~ ^[[:space:]]*# ]]; then
+                continue
+              fi
+              
+              echo \">>> Executing: \$cmd\"
+              eval \"\$cmd\" || echo \"!!! Command failed: \$cmd\"
+            done < \"$GITHUB_WORKSPACE/$REBOOT_FILE\""
+            
+            echo ">>> Finished executing $REBOOT_FILE commands"
+          else
+            echo ">>> No $REBOOT_FILE found, skipping custom commands"
+          fi
+
+          echo ">>> Configure & start OpenSSH server"
+          sudo mkdir -p /var/run/sshd
+
+          # 检查是否有保存的密码（从 ssh.txt 读取）
+          SAVED_PASSWORD=""
+          if [ -f ssh.txt ]; then
+            SAVED_PASSWORD=$(grep -oP '(?<=password: ).+' ssh.txt 2>/dev/null || true)
+            if [ -n "$SAVED_PASSWORD" ]; then
+              echo ">>> Found saved password from ssh.txt, reusing it"
+              ROOT_PASS="$SAVED_PASSWORD"
+            fi
+          fi
+          
+          # 如果没有保存的密码，生成新密码
+          if [ -z "${ROOT_PASS:-}" ]; then
+            ROOT_PASS="$(openssl rand -base64 18 | tr -d '=+/' | head -c 16)"
+            echo ">>> Generated new root password (first run)"
+          fi
+
+          # 设置 root 密码
+          echo "root:${ROOT_PASS}" | sudo chpasswd
+
+          # 恢复 SSH host keys（如果存在）
+          if [ -d key ]; then
+            echo ">>> Found saved SSH host keys, restoring..."
+            sudo cp -f key/* /etc/ssh/
+            sudo chmod 600 /etc/ssh/ssh_host_*_key
+            sudo chmod 644 /etc/ssh/ssh_host_*_key.pub
+            echo ">>> SSH host keys restored"
+          else
+            echo ">>> No saved SSH host keys found, will generate new ones"
+          fi
+
+          # 调整 sshd 配置：允许 root & 密码登录
+          sudo sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
+          sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+          sudo sed -i 's/^#\?KbdInteractiveAuthentication .*/KbdInteractiveAuthentication no/' /etc/ssh/sshd_config || true
+
+          # 设置主机名为 Mugassn
+          echo ">>> Setting hostname to Mugassn"
+          sudo hostnamectl set-hostname "Mugassn" 2>/dev/null || sudo hostname "Mugassn"
+
+          # 启动 sshd（会自动生成缺失的 host keys）
+          sudo /usr/sbin/sshd -D -e &
+          SSHD_PID=$!
+          echo ">>> sshd started with PID $SSHD_PID"
+          
+          # 等待 sshd 生成 host keys
+          sleep 2
+          
+          # 备份 SSH host keys 到仓库（首次运行或 keys 更新时）
+          if [ ! -d key ]; then
+            echo ">>> Backing up SSH host keys..."
+            mkdir -p key
+            sudo cp /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub key/
+            sudo chmod 644 key/*
+            echo ">>> SSH host keys backed up to key/"
+          fi
+
+          # 只删除 ssh.txt，保留 web.txt（用户可能已自定义域名）
+          rm -f ssh.txt
+
+          # 提取仓库名称（去掉用户名前缀）
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          echo ">>> Repository name: $REPO_NAME"
+
+          # ===== 管理 Serveo 客户端 SSH 密钥和指纹 =====
+          SERVEO_KEY_FILE="key.txt"
+          SERVEO_FINGERPRINT_FILE="fingerprint.txt"
+          SERVEO_PRIVATE_KEY="$HOME/.ssh/serveo_client_key"
+          
+          # 确保 .ssh 目录存在
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          
+          if [ -f "$SERVEO_KEY_FILE" ]; then
+            echo ">>> Found existing Serveo client key, restoring..."
+            # 恢复私钥
+            cat "$SERVEO_KEY_FILE" > "$SERVEO_PRIVATE_KEY"
+            chmod 600 "$SERVEO_PRIVATE_KEY"
+            
+            # 恢复指纹
+            if [ -f "$SERVEO_FINGERPRINT_FILE" ]; then
+              SERVEO_FINGERPRINT=$(cat "$SERVEO_FINGERPRINT_FILE")
+              echo ">>> Restored Serveo fingerprint: $SERVEO_FINGERPRINT"
+            fi
+          else
+            echo ">>> Generating new Serveo client SSH key..."
+            # 生成新的 ED25519 密钥（无密码）
+            ssh-keygen -t ed25519 -f "$SERVEO_PRIVATE_KEY" -N "" -C "serveo-client-${REPO_NAME}"
+            
+            # 计算指纹
+            SERVEO_FINGERPRINT=$(ssh-keygen -lf "$SERVEO_PRIVATE_KEY" | awk '{print $2}')
+            echo ">>> Generated Serveo fingerprint: $SERVEO_FINGERPRINT"
+            
+            # 保存私钥和指纹到仓库
+            cat "$SERVEO_PRIVATE_KEY" > "$SERVEO_KEY_FILE"
+            echo "$SERVEO_FINGERPRINT" > "$SERVEO_FINGERPRINT_FILE"
+            chmod 644 "$SERVEO_KEY_FILE" "$SERVEO_FINGERPRINT_FILE"
+            
+            echo ">>> Saved Serveo key and fingerprint to repository"
+            
+            # 首次生成密钥，需要提交到仓库
+            git config user.name "permanent-node-automation"
+            git config user.email "permanent-node-automation@noreply.local"
+            git add "$SERVEO_KEY_FILE" "$SERVEO_FINGERPRINT_FILE" || true
+            git commit -m "chore: add serveo client key and fingerprint" || true
+            REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+            git push "$REMOTE_URL" HEAD:${GITHUB_REF_NAME} || echo "git push failed (non-fatal)"
+          fi
+
+          # ===== 读取 web.txt 获取所有域名配置 =====
+          declare -A PORT_DOMAINS
+          PORT_DOMAINS_COUNT=0
+          if [ -f "web.txt" ]; then
+            echo ">>> Reading domain configuration from web.txt..."
+            cat web.txt
+            while IFS= read -r line; do
+              [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+              if [[ "$line" =~ ^([0-9]+)[[:space:]]+https?://([^[:space:]]+) ]]; then
+                port="${BASH_REMATCH[1]}"
+                domain="${BASH_REMATCH[2]}"
+                PORT_DOMAINS["$port"]="$domain"
+                PORT_DOMAINS_COUNT=$((PORT_DOMAINS_COUNT + 1))
+                echo ">>> Port $port -> domain: $domain"
+              fi
+            done < web.txt
+          else
+            echo ">>> web.txt not found, no domain configuration available"
+          fi
+
+          # ===== 配置 Cloudflare DNS TXT 记录（仅针对 mugassn.dpdns.org 子域）=====
+          # 只为我们自己的子域配置 DNS，自定义域名由用户自己配置
+          
+          declare -A SUBDOMAINS_TO_CONFIGURE
+          SUBDOMAIN_COUNT=0
+          # 只在 PORT_DOMAINS 不为空时遍历
+          if [ "$PORT_DOMAINS_COUNT" -gt 0 ]; then
+            for port in "${!PORT_DOMAINS[@]}"; do
+              domain="${PORT_DOMAINS[$port]}"
+              # 检查是否为 mugassn.dpdns.org 子域（不包括 serveo.net）
+              if [[ "$domain" =~ ^([^.]+)\.mugassn\.dpdns\.org$ ]]; then
+                subdomain="${BASH_REMATCH[1]}"
+                SUBDOMAINS_TO_CONFIGURE["$subdomain"]=1
+                SUBDOMAIN_COUNT=$((SUBDOMAIN_COUNT + 1))
+                echo ">>> Will configure DNS for subdomain: $subdomain"
+              else
+                echo ">>> Skipping DNS config for custom/external domain: $domain"
+              fi
+            done
+          fi
+          
+          # 如果有需要配置的子域且有指纹，配置 DNS
+          if [ "$SUBDOMAIN_COUNT" -gt 0 ] && [ -n "${SERVEO_FINGERPRINT:-}" ]; then
+            echo ">>> Configuring Cloudflare DNS for $SUBDOMAIN_COUNT subdomains..."
+            
+            # Cloudflare API 配置
+            CF_API_TOKEN="yHCjTnrTBDdlXq8FBdUho9gmolBVb1cRO-HUrNjs"
+            CF_ZONE_ID="1381075946420150b48ef98ef234ca0b"
+            CF_DOMAIN="mugassn.dpdns.org"
+            
+            # 为每个子域配置 DNS
+            for subdomain in "${!SUBDOMAINS_TO_CONFIGURE[@]}"; do
+              txt_record_name="_serveo-authkey.${subdomain}"
+              full_domain="${txt_record_name}.${CF_DOMAIN}"
+              
+              echo ">>> Configuring DNS TXT record: ${full_domain}"
+              
+              # 检查记录是否已存在
+              CHECK_URL="https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=TXT&name=${full_domain}"
+              CHECK_RESPONSE=$(curl -s -X GET "${CHECK_URL}" -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" || echo "")
+              RECORD_ID=$(echo "$CHECK_RESPONSE" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "")
+              
+              if [ -n "$RECORD_ID" ]; then
+                # 更新现有记录
+                echo ">>> Updating existing DNS record (ID: $RECORD_ID)..."
+                UPDATE_URL="https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records/${RECORD_ID}"
+                RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X PUT "${UPDATE_URL}" \
+                  -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                  -H "Content-Type: application/json" \
+                  -d "{\"type\":\"TXT\",\"name\":\"${txt_record_name}\",\"content\":\"\\\"${SERVEO_FINGERPRINT}\\\"\",\"ttl\":300,\"proxied\":false}" || echo "CURL_FAILED")
+                echo ">>> Response: $RESPONSE"
+              else
+                # 创建新记录
+                echo ">>> Creating new DNS record..."
+                CREATE_URL="https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records"
+                RESPONSE=$(curl -s -w "\nHTTP_CODE:%{http_code}" -X POST "$CREATE_URL" \
+                  -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                  -H "Content-Type: application/json" \
+                  -d "{\"type\":\"TXT\",\"name\":\"${txt_record_name}\",\"content\":\"\\\"${SERVEO_FINGERPRINT}\\\"\",\"ttl\":300,\"proxied\":false}" || echo "CURL_FAILED")
+                echo ">>> Response: $RESPONSE"
+              fi
+              
+              echo ">>> DNS configured for ${full_domain}"
+            done
+            
+            # 等待 DNS 生效
+            echo ">>> Waiting for DNS propagation (30 seconds)..."
+            sleep 30
+          else
+            echo ">>> No subdomain DNS configuration needed"
+          fi
+
+          # 配置 SSH 客户端（禁用严格主机密钥检查）
+          mkdir -p ~/.ssh
+          {
+            echo "Host serveo.net"
+            echo "    StrictHostKeyChecking no"
+            echo "    UserKnownHostsFile /dev/null"
+            echo "    ServerAliveInterval 60"
+            echo "    ServerAliveCountMax 3"
+            echo "    IdentityFile $SERVEO_PRIVATE_KEY"
+          } > ~/.ssh/config
+
+          echo ">>> Start serveo tunnel for SSH (local port 22)"
+          # SSH 隧道：ssh -J serveo.net root@mugassn-仓库名
+          nohup ssh -i "$SERVEO_PRIVATE_KEY" -o StrictHostKeyChecking=no -o ServerAliveInterval=60 -R "mugassn-${REPO_NAME}:22:localhost:22" serveo.net > serveo_ssh.log 2>&1 &
+          SSH_TUNNEL_PID=$!
+          echo ">>> SSH tunnel started with PID $SSH_TUNNEL_PID"
+
+          # OpenClaw 默认端口 18789（自动添加）
+          echo ">>> Configuring OpenClaw default port 18789..."
+          OPENCLAW_PORT="18789"
+          
+          # 额外 TCP 端口（可为空：不填就是只开 SSH，不建任何端口映射）
+          # 将 18789 添加到端口列表（如果用户没有指定）
+          if [[ ! "$PORT_LIST_STR" =~ (^|[,[:space:]])18789([,[:space:]]|$) ]]; then
+            if [ -n "$PORT_LIST_STR" ]; then
+              PORT_LIST_STR="${PORT_LIST_STR},${OPENCLAW_PORT}"
+            else
+              PORT_LIST_STR="${OPENCLAW_PORT}"
+            fi
+            echo ">>> Added OpenClaw port 18789 to port list"
+          fi
+          
+          # 使用 IFS 正确分割逗号分隔的端口列表
+          IFS=',' read -ra PORTS <<< "$PORT_LIST_STR"
+          
+          if [ "${#PORTS[@]}" -gt 0 ]; then
+            echo ">>> Start serveo tunnels for extra TCP ports ..."
+            for p in "${PORTS[@]}"; do
+              p_trim="$(echo "$p" | xargs || true)"
+              if [ -z "$p_trim" ]; then
+                continue
+              fi
+              log_file="serveo_${p_trim}.log"
+              
+              # 使用 web.txt 中的域名配置（如果存在）
+              if [ "$PORT_DOMAINS_COUNT" -gt 0 ] && [ -n "${PORT_DOMAINS[$p_trim]:-}" ]; then
+                DOMAIN="${PORT_DOMAINS[$p_trim]}"
+                echo "  - launching serveo tunnel for local port $p_trim with domain ${DOMAIN}..."
+                nohup ssh -i "$SERVEO_PRIVATE_KEY" -o StrictHostKeyChecking=no -o ServerAliveInterval=60 -R "${DOMAIN}:80:localhost:${p_trim}" serveo.net > "$log_file" 2>&1 &
+              else
+                # 如果 web.txt 中没有配置，使用默认子域名
+                SUBDOMAIN="mugassn-${REPO_NAME}"
+                echo "  - launching serveo tunnel for local port $p_trim with default subdomain ${SUBDOMAIN}..."
+                nohup ssh -i "$SERVEO_PRIVATE_KEY" -o StrictHostKeyChecking=no -o ServerAliveInterval=60 -R "${SUBDOMAIN}:80:localhost:${p_trim}" serveo.net > "$log_file" 2>&1 &
+              fi
+            done
+          fi
+
+          echo ">>> Waiting for serveo to establish tunnels ..."
+          sleep 10
+
+          # 生成 SSH 连接命令
+          SSH_CMD="ssh -J host.mugassn.dpdns.org root@mugassn-${REPO_NAME}"
+          echo ">>> SSH command: ${SSH_CMD}"
+
+          {
+            echo "${SSH_CMD}"
+            echo "password: ${ROOT_PASS}"
+          } > ssh.txt
+
+          # 如果 web.txt 不存在，生成它；如果已存在，保持不变
+          if [ ! -f "web.txt" ] && [ "${#PORTS[@]}" -gt 0 ]; then
+            echo ">>> Generating initial web.txt with custom domain prefixes..."
+            > web.txt
+            for p in "${PORTS[@]}"; do
+              p_trim="$(echo "$p" | xargs || true)"
+              if [ -z "$p_trim" ]; then
+                continue
+              fi
+              
+              # 检查是否有自定义前缀
+              if [ -n "${PORT_PREFIX_MAP[$p_trim]:-}" ]; then
+                # 使用自定义前缀：prefix-仓库名.mugassn.dpdns.org
+                PREFIX="${PORT_PREFIX_MAP[$p_trim]}"
+                SUBDOMAIN="${PREFIX}-${REPO_NAME}"
+                echo "${p_trim} http://${SUBDOMAIN}.mugassn.dpdns.org" >> web.txt
+                echo ">>> Port ${p_trim} -> http://${SUBDOMAIN}.mugassn.dpdns.org (custom prefix: ${PREFIX})"
+              else
+                # 为 OpenClaw 端口 18789 使用特殊前缀
+                if [ "$p_trim" = "18789" ]; then
+                  SUBDOMAIN="openclaw-${REPO_NAME}"
+                  echo "${p_trim} http://${SUBDOMAIN}.mugassn.dpdns.org" >> web.txt
+                  echo ">>> Port ${p_trim} -> http://${SUBDOMAIN}.mugassn.dpdns.org (openclaw)"
+                else
+                  # 使用默认子域名格式：default-仓库名.mugassn.dpdns.org
+                  SUBDOMAIN="default-${REPO_NAME}"
+                  echo "${p_trim} http://${SUBDOMAIN}.mugassn.dpdns.org" >> web.txt
+                  echo ">>> Port ${p_trim} -> http://${SUBDOMAIN}.mugassn.dpdns.org (default)"
+                fi
+              fi
+            done
+          else
+            echo ">>> web.txt already exists, keeping existing configuration"
+          fi
+          
+          # 添加 Serveo 指纹到 web.txt（如果还没有）
+          if [ -n "${SERVEO_FINGERPRINT:-}" ]; then
+            # 检查 web.txt 是否已包含指纹
+            if ! grep -q "# Serveo SSH Key Fingerprint:" web.txt 2>/dev/null; then
+              echo "" >> web.txt
+              echo "# Serveo SSH Key Fingerprint:" >> web.txt
+              echo "# ${SERVEO_FINGERPRINT}" >> web.txt
+            fi
+          fi
+
+          echo ">>> Configure git & push ssh.txt / web.txt / key/ ..."
+          git config user.name "permanent-node-automation"
+          git config user.email "permanent-node-automation@noreply.local"
+
+          git add ssh.txt web.txt key/ || true
+          # 添加 Serveo 密钥和指纹文件
+          [ -f key.txt ] && git add key.txt || echo "key.txt not found"
+          [ -f fingerprint.txt ] && git add fingerprint.txt || echo "fingerprint.txt not found"
+          # 添加 reboot.txt 和 shut.txt 到版本控制
+          [ -f reboot.txt ] && git add reboot.txt || echo "reboot.txt not found"
+          [ -f shut.txt ] && git add shut.txt || echo "shut.txt not found"
+          [ -f backup.txt ] && git add backup.txt || echo "backup.txt not found (normal for first run)"
+          TS="$(date -u +%Y%m%dT%H%M%SZ)"
+          git commit -m "chore: update permanent node endpoints $TS" || echo "Nothing to commit"
+
+          REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push "$REMOTE_URL" HEAD:${GITHUB_REF_NAME} || echo "git push failed (non-fatal)"
+
+          echo ">>> Permanent OpenClaw node ready! Local storage at ~/.openclaw"
+          echo ">>> Running for ${TTL_MIN} minutes..."
+          
+          # 创建备份函数
+          backup_data() {
+            echo ">>> Starting ~/.openclaw backup and upload..."
+            
+            # 清空旧的 backup.txt（覆盖旧备份）
+            > "$GITHUB_WORKSPACE/backup.txt"
+            echo ">>> Cleared old backup.txt"
+            
+            echo ">>> Checking ~/.openclaw directory..."
+            ls -la ~/.openclaw || echo "!!! Failed to list ~/.openclaw"
+            
+            if [ -d ~/.openclaw ]; then
+              echo ">>> ~/.openclaw directory exists"
+              if [ "$(ls -A ~/.openclaw 2>/dev/null)" ]; then
+                echo ">>> ~/.openclaw directory is not empty, proceeding with backup..."
+                
+                BACKUP_TIME=$(TZ='Asia/Shanghai' date +'%Y%m%d_%H%M%S')
+                BACKUP_FILE="/tmp/openclaw_backup_${BACKUP_TIME}.tar.gz"
+                echo ">>> Creating backup: $BACKUP_FILE"
+                tar -czf "$BACKUP_FILE" --exclude="$BACKUP_FILE" -C ~/.openclaw .
+                
+                BACKUP_SIZE=$(stat -c%s "$BACKUP_FILE" 2>/dev/null || echo "0")
+                BACKUP_SIZE_MB=$((BACKUP_SIZE / 1024 / 1024))
+                echo ">>> Backup size: ${BACKUP_SIZE_MB}MB (${BACKUP_SIZE} bytes)"
+                
+                if [ "$BACKUP_SIZE" -gt 0 ]; then
+                  # 检查是否需要分片（大于 4.5GB）
+                  BACKUP_SIZE_GB=$(echo "scale=2; $BACKUP_SIZE / 1024 / 1024 / 1024" | bc)
+                  
+                  if (( $(echo "$BACKUP_SIZE_GB > 4.5" | bc -l) )); then
+                    echo ">>> Backup is larger than 4.5GB, splitting into 4.5GB chunks..."
+                    cd /tmp
+                    split -b 4500M "$BACKUP_FILE" "${BACKUP_FILE}.part"
+                    rm -f "$BACKUP_FILE"
+                    
+                    PART_NUM=1
+                    for part_file in "${BACKUP_FILE}".part*; do
+                      if [ -f "$part_file" ]; then
+                        NEW_NAME="openclaw_backup_${BACKUP_TIME}.part${PART_NUM}.tar.gz"
+                        mv "$part_file" "$NEW_NAME"
+                        PART_NUM=$((PART_NUM + 1))
+                      fi
+                    done
+                    
+                    UPLOAD_SUCCESS=true
+                    PART_COUNT=0
+                    for part_file in openclaw_backup_${BACKUP_TIME}.part*.tar.gz; do
+                      if [ -f "$part_file" ]; then
+                        PART_COUNT=$((PART_COUNT + 1))
+                        echo ">>> Uploading part ${PART_COUNT}: $(basename "$part_file")"
+                        UPLOAD_RESULT=$(curl -s https://bashupload.app -T "$part_file")
+                        echo ">>> Upload result: $UPLOAD_RESULT"
+                        DOWNLOAD_URL=$(echo "$UPLOAD_RESULT" | grep -oE 'http://bashupload\.app/[a-zA-Z0-9]+\.bin' | head -n 1 || true)
+                        echo ">>> Extracted URL: [$DOWNLOAD_URL]"
+                        
+                        if [ -n "$DOWNLOAD_URL" ]; then
+                          echo ">>> Part ${PART_COUNT} upload successful: $DOWNLOAD_URL"
+                          echo "$(basename "$part_file") $DOWNLOAD_URL" >> "$GITHUB_WORKSPACE/backup.txt"
+                        else
+                          echo "!!! Part ${PART_COUNT} upload failed"
+                          UPLOAD_SUCCESS=false
+                        fi
+                        rm -f "$part_file"
+                      fi
+                    done
+                    
+                    if [ "$UPLOAD_SUCCESS" = true ]; then
+                      echo ">>> All ${PART_COUNT} parts uploaded successfully"
+                      cd "$GITHUB_WORKSPACE"
+                      git add backup.txt || true
+                      BACKUP_TS="$(date -u +%Y%m%dT%H%M%SZ)"
+                      git commit -m "chore: backup $BACKUP_TS" || true
+                      REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+                      git push "$REMOTE_URL" HEAD:${GITHUB_REF_NAME} || true
+                      echo ">>> Backup committed to repository"
+                    else
+                      echo "!!! Some parts failed to upload"
+                    fi
+                  else
+                    echo ">>> Uploading to bashupload.app..."
+                    cd /tmp
+                    
+                    # 上传文件
+                    UPLOAD_RESULT=$(curl -s https://bashupload.app -T "$BACKUP_FILE")
+                    echo ">>> Upload result: $UPLOAD_RESULT"
+                    
+                    # 直接用 grep 提取 URL（从整个输出中提取）
+                    DOWNLOAD_URL=$(echo "$UPLOAD_RESULT" | grep -oE 'http://bashupload\.app/[a-zA-Z0-9]+\.bin' | head -n 1 || true)
+                    echo ">>> Extracted URL: [$DOWNLOAD_URL]"
+                    
+                    if [ -n "$DOWNLOAD_URL" ]; then
+                      echo ">>> Upload successful: $DOWNLOAD_URL"
+                      echo "$(basename "$BACKUP_FILE") $DOWNLOAD_URL" >> "$GITHUB_WORKSPACE/backup.txt"
+                      
+                      cd "$GITHUB_WORKSPACE"
+                      git add backup.txt || true
+                      BACKUP_TS="$(date -u +%Y%m%dT%H%M%SZ)"
+                      git commit -m "chore: backup $BACKUP_TS" || true
+                      REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+                      git push "$REMOTE_URL" HEAD:${GITHUB_REF_NAME} || true
+                      echo ">>> Backup committed to repository"
+                    else
+                      echo "!!! Upload failed or URL extraction failed"
+                    fi
+                    
+                    rm -f "$BACKUP_FILE"
+                  fi
+                fi
+              else
+                echo ">>> ~/.openclaw directory is empty, skipping backup"
+              fi
+            else
+              echo ">>> ~/.openclaw directory does not exist, skipping backup"
+            fi
+          }
+          
+          # 设置陷阱：在收到 TERM 信号时执行备份
+          trap 'echo ">>> Received termination signal, executing backup..."; backup_data; exit 0' TERM INT
+          
+          # 等待到 TTL 结束（可被信号中断）
+          sleep "$TTL_SEC" &
+          wait $!
+          
+          echo ">>> TTL reached, executing shutdown commands if any..."
+          
+          # 执行关机前命令（如果存在）
+          SHUTDOWN_FILE="shut.txt"
+          if [ -f "$SHUTDOWN_FILE" ]; then
+            echo ">>> Found $SHUTDOWN_FILE, executing shutdown commands..."
+            echo ">>> Working directory: /root"
+            
+            # 使用 sudo 切换到 /root 目录执行命令
+            sudo bash -c "cd /root && while IFS= read -r cmd || [ -n \"\$cmd\" ]; do
+              # 跳过空行和注释行
+              if [ -z \"\$cmd\" ] || [[ \"\$cmd\" =~ ^[[:space:]]*# ]]; then
+                continue
+              fi
+              
+              echo \">>> Executing: \$cmd\"
+              eval \"\$cmd\" || echo \"!!! Command failed: \$cmd\"
+            done < \"$GITHUB_WORKSPACE/$SHUTDOWN_FILE\""
+            
+            echo ">>> Custom shutdown commands completed"
+          else
+            echo ">>> No $SHUTDOWN_FILE found, skipping shutdown commands"
+          fi
+          
+          # 执行备份
+          echo ">>> Executing backup..."
+          backup_data
+          
+          # 提交其他文件到仓库
+          cd "$GITHUB_WORKSPACE"
+          git add ssh.txt web.txt key/ reboot.txt shut.txt || true
+          [ -f key.txt ] && git add key.txt || true
+          [ -f fingerprint.txt ] && git add fingerprint.txt || true
+          [ -f backup.txt ] && git add backup.txt || true
+          git commit -m "chore: update node files" || true
+          REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push "$REMOTE_URL" HEAD:${GITHUB_REF_NAME} || true
+          
+          # 等待同步完成
+          echo ">>> Waiting for sync to complete..."
+          sleep 60
+          
+          echo ">>> Triggering next run to replace this one..."
+          
+          # 触发新运行（会自动取消当前运行）
+          curl -s -X POST \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/dispatches" \
+            -d '{"event_type":"restart-permanent-openclaw"}' || echo "Trigger failed, cron will handle restart"
+          
+          echo ">>> New run triggered, current run will be cancelled automatically"
+          echo ">>> Waiting for cancellation..."
+          
+          # 给下一轮启动缓冲时间，避免重叠
+          sleep 180  # 3分钟缓冲时间
