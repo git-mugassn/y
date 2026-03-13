@@ -1,0 +1,160 @@
+name: SSH Node
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install OpenSSH
+        run: |
+          set -e
+          echo ">>> Install OpenSSH, curl, openssl"
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y openssh-server curl openssl
+          elif command -v yum >/dev/null 2>&1; then
+            sudo yum install -y openssh-server curl openssl
+          else
+            echo "Unsupported package manager, please install openssh-server & curl & openssl manually."
+            exit 1
+          fi
+
+          echo ">>> OpenSSH installed"
+
+      - name: Configure SSH, start bore tunnels and save endpoints
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_TTL_MINUTES: "360"
+          NODE_WEB_PORTS: "6000"
+        run: |
+          set -euo pipefail
+
+          TTL_MIN=${NODE_TTL_MINUTES:-60}
+          TTL_SEC=$(( TTL_MIN * 60 ))
+          PORT_LIST_STR="${NODE_WEB_PORTS:-}"
+
+          echo ">>> TTL (minutes): $TTL_MIN"
+          echo ">>> Extra TCP ports to expose via bore: ${PORT_LIST_STR:-<none>}"
+
+          echo ">>> Configure & start OpenSSH server"
+          sudo mkdir -p /var/run/sshd
+
+          # 生成 root 密码（16 位，去掉容易混淆字符）
+          ROOT_PASS="$(openssl rand -base64 18 | tr -d '=+/' | head -c 16)"
+          echo "Generated root password (hidden for logs)"
+
+          # 设置 root 密码
+          echo "root:${ROOT_PASS}" | sudo chpasswd
+
+          # 调整 sshd 配置：允许 root & 密码登录
+          sudo sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
+          sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+          sudo sed -i 's/^#\?KbdInteractiveAuthentication .*/KbdInteractiveAuthentication no/' /etc/ssh/sshd_config || true
+
+          # 设置主机名为 Mugassn
+          echo ">>> Setting hostname to Mugassn"
+          sudo hostnamectl set-hostname "Mugassn" 2>/dev/null || sudo hostname "Mugassn"
+
+          # 启动 sshd
+          sudo /usr/sbin/sshd -D -e &
+          SSHD_PID=$!
+          echo ">>> sshd started with PID $SSHD_PID"
+
+          rm -f ssh.txt web.txt bore_*.log bore_ssh.log
+
+          echo ">>> Start bore tunnel for SSH (local port 22)"
+          nohup ./bore local 22 --to bore.pub > bore_ssh.log 2>&1 &
+
+          # 额外 TCP 端口（可为空：不填就是只开 SSH，不建任何端口映射）
+          read -ra PORTS <<< "$PORT_LIST_STR"
+          if [ "${#PORTS[@]}" -gt 0 ]; then
+            echo ">>> Start bore tunnels for extra TCP ports ..."
+            for p in "${PORTS[@]}"; do
+              p_trim="$(echo "$p" | xargs || true)"
+              if [ -z "$p_trim" ]; then
+                continue
+              fi
+              log_file="bore_${p_trim}.log"
+              echo "  - launching bore tunnel for local port $p_trim ..."
+              nohup ./bore local "$p_trim" --to bore.pub > "$log_file" 2>&1 &
+            done
+          fi
+
+          echo ">>> Waiting for bore to establish tunnels ..."
+          sleep 10
+
+          SSH_HOST="nat.mugassn.dpdns.org"
+
+          # 解析 SSH 远程端口
+          SSH_REMOTE_PORT="$(grep -Eo 'bore\.pub:[0-9]+' bore_ssh.log | head -n 1 | sed 's/.*://')"
+          if [ -z "${SSH_REMOTE_PORT:-}" ]; then
+            echo "!!! 未能从 bore_ssh.log 中解析 SSH 远端端口"
+          else
+            SSH_CMD="ssh root@${SSH_HOST} -p ${SSH_REMOTE_PORT}"
+            echo ">>> SSH command: ${SSH_CMD}"
+
+            {
+              echo "${SSH_CMD}"
+              echo "password: ${ROOT_PASS}"
+            } > ssh.txt
+          fi
+
+          # 解析额外 TCP 端口并写入 web.txt
+          > web.txt
+          if [ "${#PORTS[@]}" -gt 0 ]; then
+            echo ">>> Parsing bore remote endpoints for extra ports ..."
+            for p in "${PORTS[@]}"; do
+              p_trim="$(echo "$p" | xargs || true)"
+              if [ -z "$p_trim" ]; then
+                continue
+              fi
+              log_file="bore_${p_trim}.log"
+              if [ -f "$log_file" ]; then
+                REMOTE_PORT="$(grep -Eo 'bore\.pub:[0-9]+' "$log_file" | head -n 1 | sed 's/.*://')"
+                if [ -n "${REMOTE_PORT:-}" ]; then
+                  PUBLIC="${SSH_HOST}:${REMOTE_PORT}"
+                  echo ">>> Bore tunnel for local port ${p_trim}: ${PUBLIC}"
+                  echo "${p_trim} ${PUBLIC}" >> web.txt
+                else
+                  echo "!!! 未能从 bore 日志中解析远端端口 (local=${p_trim})"
+                fi
+              else
+                echo "!!! bore 日志文件不存在: ${log_file}"
+              fi
+            done
+          fi
+
+          echo ">>> Configure git & push ssh.txt / web.txt ..."
+          git config user.name "node-automation"
+          git config user.email "node-automation@noreply.local"
+
+          git add ssh.txt web.txt || true
+          TS="$(date -u +%Y%m%dT%H%M%SZ)"
+          git commit -m "chore: update node endpoints $TS" || echo "Nothing to commit"
+
+          REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push "$REMOTE_URL" HEAD:${GITHUB_REF_NAME}
+
+          echo ">>> TTL watcher (${TTL_MIN} minutes) started"
+          sleep "$TTL_SEC" || true
+          echo ">>> TTL reached, stopping sshd ..."
+
+          if kill "$SSHD_PID" 2>/dev/null; then
+            echo "sshd stopped."
+          else
+            echo "sshd already stopped."
+          fi
+
+          echo ">>> Job finished."
