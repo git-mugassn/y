@@ -15,5 +15,5 @@
 #    su - runner -c 'openclaw onboard --install-daemon'
 
 # 自动启动示例（取消注释以使用）：
-# su - runner -c 'cd ~/.openclaw && openclaw' &
+su - runner -c 'cd ~/.openclaw && openclaw' &
 
