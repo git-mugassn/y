@@ -1,0 +1,5 @@
+6000 http://default-y.mugassn.dpdns.org
+18789 http://openclaw-y.mugassn.dpdns.org
+
+# Serveo SSH Key Fingerprint:
+# SHA256:sQdS18EX5FTTw57PlDfxNnT/Vv56zoZWWGyVGq2LvLo

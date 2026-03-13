@@ -1,0 +1,2 @@
+ssh -J host.mugassn.dpdns.org root@mugassn-y
+password: kA0W3D4srsCxyKU7
